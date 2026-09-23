@@ -9,6 +9,17 @@ segments ``[start, end)``. Every segment uses source A or B. Choosing source
 so the activation fee is paid once per segment, including when adjacent
 segments use the same source.
 
+Each source may additionally be temporarily unavailable on a set of
+half-open position windows (the optional ``unavailable`` argument, a pair of
+``(windows_a, windows_b)``). A segment is legal only when it also lies
+entirely outside its own source's windows. Availability is part of the
+recurrences themselves -- predecessor ranges, final-source states, the
+reverse minimum-cost sweep and the certainty merge -- never a post-hoc
+filter on the unconstrained optimum. When no complete legal cover exists,
+:class:`NoFeasibleRepair` is raised. With empty window lists every table
+reduces to the plain ``[j-L, j-1]`` window, so old and new code paths are
+the same computation.
+
 The default objective compares candidates lexicographically by
 ``(cost, segments, predecessor, source)``.
 
@@ -35,14 +46,16 @@ source-``s`` segment ``[i, j)`` can occur in a minimum-cost cover iff
 where ``f[i]`` is the cheapest cost of covering ``[0, i)`` (over all sources)
 and ``g[j]`` the cheapest cost of covering ``[j, n)`` (over all sources);
 note the suffix does not depend on the source of the segment ending at ``j``.
-For fixed ``(j, s)`` the minimizing prefixes ``i`` in the legal window
-``[j-L, j-1]`` form a contiguous range; its leftmost member is a
-sliding-window minimum of ``f[i] - prefix_s[i]`` and the range is merged into
-a difference-array sweep. No segmentation is enumerated and winning-
+For fixed ``(j, s)`` the minimizing prefixes ``i`` in the legal predecessor
+range form a contiguous range; its leftmost member is a sliding-window
+minimum of ``f[i] - prefix_s[i]`` and the range is merged into a
+difference-array sweep. No segmentation is enumerated and winning-
 predecessor replay is not enough, as it cannot reveal alternative optimal
 predecessors.
 
-Everything here uses O(n) time and O(n) space.
+Everything here uses O(n + m) time and O(n) space where ``m`` is the total
+number of unavailable windows; positions and windows are never combined into
+a Cartesian product.
 """
 
 from collections import deque
@@ -58,9 +71,17 @@ OBJECTIVE_CONTINUITY = "continuity"
 
 _NO_SOURCE = -1
 
+# Costs are bounded by n * 1_000_000 + n * 1_000_000 < 10**12; this sentinel
+# is safely beyond every finite plan cost.
+_INF = 10**30
+
 CERTAINTY_A_ONLY = "A_ONLY"
 CERTAINTY_B_ONLY = "B_ONLY"
 CERTAINTY_EITHER = "EITHER"
+
+
+class NoFeasibleRepair(Exception):
+    """Raised when availability windows rule out every complete cover."""
 
 
 @dataclass(frozen=True)
@@ -82,21 +103,90 @@ class Solution:
     certainty: tuple[str, ...] = field(default=())
 
 
+@dataclass(frozen=True)
+class Availability:
+    """Per-source blocked-position lookup tables.
+
+    ``last_down[s][j]`` is the largest blocked position ``p < j`` of source
+    ``s`` (``-1`` when there is none); a source-``s`` segment ``[i, j)`` is
+    legal iff ``i > last_down[s][j]`` and ``i >= j - L``.
+
+    ``next_down[s][j]`` is the smallest blocked position ``p >= j`` (``n``
+    when there is none); a source-``s`` segment ``[j, k)`` is legal iff
+    ``k <= next_down[s][j]`` and ``k <= j + L``.
+    """
+
+    last_down: tuple[list[int], list[int]]
+    next_down: tuple[list[int], list[int]]
+
+
+def _build_availability(
+    n: int, unavailable
+) -> Availability:
+    """Build the blocked-position tables from validated half-open windows.
+
+    ``unavailable`` is ``(windows_a, windows_b)``; each list holds strictly
+    increasing, non-overlapping, non-touching ``(start, end)`` pairs. The
+    API layer validates them, so per-source coverage is a 0/1 difference
+    sweep rather than a positions-times-windows product.
+    """
+    if unavailable is None:
+        unavailable = ((), ())
+
+    last_tables: list[list[int]] = []
+    next_tables: list[list[int]] = []
+    for windows in unavailable:
+        mark = [0] * (n + 1)
+        for start, end in windows:
+            mark[start] += 1
+            mark[end] -= 1
+
+        blocked = bytearray(n)
+        active = 0
+        for k in range(n):
+            active += mark[k]
+            blocked[k] = 1 if active > 0 else 0
+
+        last = [-1] * (n + 1)
+        for j in range(1, n + 1):
+            last[j] = j - 1 if blocked[j - 1] else last[j - 1]
+
+        nxt = [n] * (n + 1)
+        for j in range(n - 1, -1, -1):
+            nxt[j] = j if blocked[j] else nxt[j + 1]
+
+        last_tables.append(last)
+        next_tables.append(nxt)
+
+    return Availability(
+        last_down=(last_tables[SOURCE_A], last_tables[SOURCE_B]),
+        next_down=(next_tables[SOURCE_A], next_tables[SOURCE_B]),
+    )
+
+
 def solve(n: int, costs: list[tuple[int, int]], fee_a: int, fee_b: int,
-          max_len: int, objective: str = OBJECTIVE_DEFAULT) -> Solution:
+          max_len: int, objective: str = OBJECTIVE_DEFAULT,
+          unavailable=None) -> Solution:
     """Compute the optimal cover of [0, n) plus per-position certainty.
 
     ``costs[k]`` is the pair of per-position costs ``(cost of A, cost of
-    B)`` at position ``k``. Inputs are assumed already validated by the API
-    layer; the algorithm itself trusts the bounds.
+    B)`` at position ``k``. ``unavailable`` is an optional
+    ``(windows_a, windows_b)`` pair of half-open ``(start, end)`` windows.
+    Inputs are assumed already validated by the API layer; the algorithm
+    itself trusts the bounds.
+
+    Raises :class:`NoFeasibleRepair` if no legal cover spans the whole gap.
     """
     fees = (fee_a, fee_b)
     prefixes = _prefix_sums(n, costs)
+    availability = _build_availability(n, unavailable)
     if objective == OBJECTIVE_CONTINUITY:
-        solution = _solve_continuity(n, prefixes, fees, max_len)
+        solution = _solve_continuity(
+            n, prefixes, fees, max_len, availability)
     else:
-        solution = _solve_default(n, prefixes, fees, max_len)
-    certainty = _certainty(n, prefixes, fees, max_len)
+        solution = _solve_default(
+            n, prefixes, fees, max_len, availability)
+    certainty = _certainty(n, prefixes, fees, max_len, availability)
     return Solution(solution.cost, solution.segments, tuple(certainty))
 
 
@@ -113,25 +203,30 @@ def _prefix_sums(
 
 
 def _solve_default(n: int, prefixes: tuple[list[int], list[int]],
-                   fees: tuple[int, int], max_len: int) -> Solution:
-    # DP tables.
-    best_cost = [0] * (n + 1)
+                   fees: tuple[int, int], max_len: int,
+                   availability: Availability) -> Solution:
+    # DP tables. Unreachable endpoints keep _INF and are never enqueued.
+    best_cost = [_INF] * (n + 1)
+    best_cost[0] = 0
     best_seg_count = [0] * (n + 1)
     prev_index = [-1] * (n + 1)
     prev_source = [-1] * (n + 1)
 
     # Each entry in window s is an index i, keyed by
-    # (best_cost[i] - prefix_s[i], best_seg_count[i], i).
+    # (best_cost[i] - prefix_s[i], best_seg_count[i], i). Only indices from
+    # which an uninterrupted source-s run reaches j can survive at the front.
     windows: tuple[deque, deque] = (deque([0]), deque([0]))
 
     for j in range(1, n + 1):
-        low = j - max_len
-        for window in windows:
-            while window and window[0] < low:
-                window.popleft()
-
         best_candidate = None  # (cost, segments, prev, source)
         for s, window in enumerate(windows):
+            # Segment [i, j) must fit the length cap and strictly pass the
+            # last blocked position of s before j.
+            low = max(j - max_len, availability.last_down[s][j] + 1)
+            while window and window[0] < low:
+                window.popleft()
+            if not window:
+                continue
             i = window[0]
             candidate = (
                 best_cost[i] - prefixes[s][i] + prefixes[s][j] + fees[s],
@@ -141,6 +236,10 @@ def _solve_default(n: int, prefixes: tuple[list[int], list[int]],
             )
             if best_candidate is None or candidate < best_candidate:
                 best_candidate = candidate
+
+        if best_candidate is None:
+            # j cannot be covered; it must not become anyone's predecessor.
+            continue
 
         cost, seg_count, i, s = best_candidate
         best_cost[j] = cost
@@ -163,14 +262,17 @@ def _solve_default(n: int, prefixes: tuple[list[int], list[int]],
                 window.pop()
             window.append(j)
 
+    if best_cost[n] >= _INF:
+        raise NoFeasibleRepair()
     return _reconstruct(n, prev_index, prev_source, best_cost[n])
 
 
 def _solve_continuity(n: int, prefixes: tuple[list[int], list[int]],
-                      fees: tuple[int, int], max_len: int) -> Solution:
+                      fees: tuple[int, int], max_len: int,
+                      availability: Availability) -> Solution:
     # State p is the source of the last segment (0=A, 1=B). Arrays are
     # indexed [p][j]. The empty prefix is not state A or B.
-    best_cost = [[0] * (n + 1) for _ in (SOURCE_A, SOURCE_B)]
+    best_cost = [[_INF] * (n + 1) for _ in (SOURCE_A, SOURCE_B)]
     switches = [[0] * (n + 1) for _ in (SOURCE_A, SOURCE_B)]
     seg_count = [[0] * (n + 1) for _ in (SOURCE_A, SOURCE_B)]
     last_start = [[0] * (n + 1) for _ in (SOURCE_A, SOURCE_B)]
@@ -186,21 +288,23 @@ def _solve_continuity(n: int, prefixes: tuple[list[int], list[int]],
     )
 
     for j in range(1, n + 1):
-        low = j - max_len
-        for row in windows:
-            for window in row:
-                while window and window[0] < low:
-                    window.popleft()
-
         for s in (SOURCE_A, SOURCE_B):
+            # Availability of the appended source s bounds every row's
+            # window identically: [max(j-L, last_down_s[j]+1), j-1].
+            low = max(j - max_len, availability.last_down[s][j] + 1)
+
             best_candidate = None
             chosen_predecessor = _NO_SOURCE
             for p in range(3):
                 window = windows[p][s]
+                while window and window[0] < low:
+                    window.popleft()
                 if not window:
                     continue
                 i = window[0]
                 if p < 2:
+                    if best_cost[p][i] >= _INF:
+                        continue
                     prefix_cost = best_cost[p][i]
                     prefix_switches = switches[p][i]
                     prefix_count = seg_count[p][i]
@@ -229,6 +333,11 @@ def _solve_continuity(n: int, prefixes: tuple[list[int], list[int]],
                 if best_candidate is None or candidate < best_candidate:
                     best_candidate = candidate
                     chosen_predecessor = predecessor_state
+
+            if best_candidate is None:
+                # No legal source-s segment ends at j; state (s, j) stays
+                # unreachable and is inserted into no predecessor window.
+                continue
 
             cost, switch_count, count, i, s, _prefix_tie = best_candidate
             best_cost[s][j] = cost
@@ -262,6 +371,8 @@ def _solve_continuity(n: int, prefixes: tuple[list[int], list[int]],
     final_candidate = None
     final_state = SOURCE_A
     for p in (SOURCE_A, SOURCE_B):
+        if best_cost[p][n] >= _INF:
+            continue
         candidate = (
             best_cost[p][n],
             switches[p][n],
@@ -273,6 +384,8 @@ def _solve_continuity(n: int, prefixes: tuple[list[int], list[int]],
             final_candidate = candidate
             final_state = p
 
+    if final_candidate is None:
+        raise NoFeasibleRepair()
     return _reconstruct_states(
         n, prev_index, prev_state, final_state, final_candidate[0])
 
@@ -312,26 +425,31 @@ def _reconstruct_states(n: int, prev_index: list[list[int]],
 
 def _min_prefix_costs(
     n: int, prefixes: tuple[list[int], list[int]],
-    fees: tuple[int, int], max_len: int
+    fees: tuple[int, int], max_len: int, availability: Availability
 ) -> list[int]:
     """f[j] = minimum cost of any legal cover of [0, j).
 
     Cost-only version of the default recurrence. Each per-source window is a
     monotone deque of indices ordered by f[i] - prefix_s[i]; expired indices
-    leave at the front.
+    leave at the front. Unreachable endpoints stay at _INF.
     """
-    f = [0] * (n + 1)
+    f = [_INF] * (n + 1)
+    f[0] = 0
     windows = (deque([0]), deque([0]))
     for j in range(1, n + 1):
-        low = j - max_len
         best = None
         for s, window in enumerate(windows):
+            low = max(j - max_len, availability.last_down[s][j] + 1)
             while window and window[0] < low:
                 window.popleft()
+            if not window:
+                continue
             i = window[0]
             value = f[i] - prefixes[s][i] + prefixes[s][j] + fees[s]
             if best is None or value < best:
                 best = value
+        if best is None:
+            continue
         f[j] = best
         for s, window in enumerate(windows):
             value = f[j] - prefixes[s][j]
@@ -346,28 +464,34 @@ def _min_prefix_costs(
 
 def _min_suffix_costs(
     n: int, prefixes: tuple[list[int], list[int]],
-    fees: tuple[int, int], max_len: int
+    fees: tuple[int, int], max_len: int, availability: Availability
 ) -> list[int]:
     """g[j] = minimum cost of any legal cover of [j, n).
 
-    The recurrence g[j] = min over (s, k) with j < k <= min(n, j+L) of
-    fee[s] + prefix_s[k] - prefix_s[j] + g[k] rewrites, for a fixed
-    successor k, as g[k] + fee[s] + prefix_s[k] minus prefix_s[j]. Indices k
-    enter the window in descending order, so the monotone deques store
-    indices in descending order and expiry (k > j + L) happens at the front.
+    The recurrence g[j] = min over (s, k) with j < k <= min(n, j+L,
+    next_down_s[j]) of fee[s] + prefix_s[k] - prefix_s[j] + g[k] rewrites,
+    for a fixed successor k, as g[k] + fee[s] + prefix_s[k] minus
+    prefix_s[j]. Indices k enter the window in descending order, so the
+    monotone deques store indices in descending order and expiry
+    (k past the length cap or the next blocked position) happens at front.
     """
-    g = [0] * (n + 1)
+    g = [_INF] * (n + 1)
+    g[n] = 0
     windows = (deque([n]), deque([n]))
     for j in range(n - 1, -1, -1):
-        high = j + max_len
         best = None
         for s, window in enumerate(windows):
+            high = min(j + max_len, availability.next_down[s][j])
             while window and window[0] > high:
                 window.popleft()
+            if not window:
+                continue
             k = window[0]
             value = g[k] + fees[s] + prefixes[s][k] - prefixes[s][j]
             if best is None or value < best:
                 best = value
+        if best is None:
+            continue
         g[j] = best
         for s, window in enumerate(windows):
             value = g[j] + fees[s] + prefixes[s][j]
@@ -382,7 +506,7 @@ def _min_suffix_costs(
 
 def _certainty(
     n: int, prefixes: tuple[list[int], list[int]],
-    fees: tuple[int, int], max_len: int
+    fees: tuple[int, int], max_len: int, availability: Availability
 ) -> list[str]:
     """Label every position by which sources occur in minimum-cost covers.
 
@@ -396,10 +520,14 @@ def _certainty(
     cover costs at least the optimum); the segment is possible iff the
     window minimum equals target. Among ties the deque keeps the smallest
     predecessor, whose single segment [i_min, j) already covers the union of
-    every minimizing predecessor's interval.
+    every minimizing predecessor's interval. Availability narrows both the
+    prefix window (last blocked position) and the suffix reachability test;
+    it is never applied after the fact.
     """
-    f = _min_prefix_costs(n, prefixes, fees, max_len)
-    g = _min_suffix_costs(n, prefixes, fees, max_len)
+    f = _min_prefix_costs(n, prefixes, fees, max_len, availability)
+    g = _min_suffix_costs(n, prefixes, fees, max_len, availability)
+    if f[n] >= _INF:
+        raise NoFeasibleRepair()
     optimum = f[n]
 
     # Per source: a monotone deque of predecessor indices ordered by
@@ -411,12 +539,12 @@ def _certainty(
     difference = ([0] * (n + 1), [0] * (n + 1))
 
     for j in range(1, n + 1):
-        low = j - max_len
-        if low < 0:
-            low = 0
         for s, window in enumerate(windows):
+            low = max(j - max_len, availability.last_down[s][j] + 1)
             while window and window[0] < low:
                 window.popleft()
+            if not window or g[j] >= _INF:
+                continue
             i = window[0]
             target = optimum - g[j] - fees[s] - prefixes[s][j]
             if f[i] - prefixes[s][i] == target:
@@ -424,11 +552,13 @@ def _certainty(
                 diff[i] += 1
                 diff[j] -= 1
 
-        for s, window in enumerate(windows):
-            key = f[j] - prefixes[s][j]
-            while window and f[window[-1]] - prefixes[s][window[-1]] > key:
-                window.pop()
-            window.append(j)
+        if f[j] < _INF:
+            for s, window in enumerate(windows):
+                key = f[j] - prefixes[s][j]
+                while window and \
+                        f[window[-1]] - prefixes[s][window[-1]] > key:
+                    window.pop()
+                window.append(j)
 
     labels = [""] * n
     active = [0, 0]
